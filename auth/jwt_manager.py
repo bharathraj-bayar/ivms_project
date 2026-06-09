@@ -51,6 +51,13 @@ class AuthManager:
         
         # Refresh tokens tracked longer
         session_manager.track_session(data.get("email"), jti, REFRESH_TOKEN_EXPIRE_DAYS * 86400)
+        # Track token family for replay prevention and rotation analysis
+        try:
+            family_key = f"ivms:token_family:{data.get('email')}"
+            session_manager.redis.sadd(family_key, jti)
+            session_manager.redis.expire(family_key, REFRESH_TOKEN_EXPIRE_DAYS * 86400)
+        except Exception:
+            pass
         return token
 
     @staticmethod

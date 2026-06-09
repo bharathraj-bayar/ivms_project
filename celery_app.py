@@ -10,7 +10,7 @@ celery_app = Celery(
     "ivms_tasks",
     broker=REDIS_URL,
     backend=REDIS_URL,
-    include=["tasks.reports", "tasks.analytics", "tasks.cleanup"]
+    include=["tasks.reports", "tasks.analytics", "tasks.cleanup", "tasks.notifications", "tasks.dispatch_notifications"]
 )
 
 celery_app.conf.update(

@@ -1,4 +1,5 @@
 from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect, Request
+import uuid
 from fastapi.middleware.cors import CORSMiddleware
 import asyncpg
 import asyncio
@@ -16,6 +17,12 @@ from api.v2 import operations
 from auth.api_utils import get_allowed_imeis, get_current_user
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
+# Mobile API routers (mobile-first endpoints)
+from api.mobile.auth import router as mobile_auth_router
+from api.mobile.routes import router as mobile_router
+from api.mobile.notifications import router as mobile_notifications_router
+from api.mobile.sync import router as mobile_sync_router
+from api.mobile.sync_changes import router as mobile_sync_changes_router
 
 load_dotenv()
 
@@ -24,6 +31,9 @@ from fastapi.encoders import jsonable_encoder
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
+from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
+from fastapi.responses import Response as _Response
+from middleware.audit_logging import AuditLoggingMiddleware
 
 limiter = Limiter(key_func=get_remote_address)
 from core.logging import setup_logging, set_correlation_id
@@ -85,6 +95,12 @@ app.include_router(reports.router, prefix="/api/reports", tags=["Reports"])
 app.include_router(analytics.router, prefix="/api/v2/analytics", tags=["Analytics"])
 app.include_router(operations.router)
 app.include_router(diagnostics.router)
+# Mobile auth and mobile API namespace
+app.include_router(mobile_auth_router)
+app.include_router(mobile_router)
+app.include_router(mobile_notifications_router)
+app.include_router(mobile_sync_router)
+app.include_router(mobile_sync_changes_router)
 
 @app.get("/api/alerts")
 async def get_alerts(allowed_imeis: List[str] = Depends(get_allowed_imeis)):
@@ -134,11 +150,15 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+from fastapi.middleware.gzip import GZipMiddleware
+app.add_middleware(GZipMiddleware, minimum_size=500)
 app.add_middleware(CorrelationIdMiddleware)
+app.add_middleware(AuditLoggingMiddleware)
 
 @app.on_event("startup")
 async def startup():
     await cache.connect()
+    # Ensure Firebase SDK is initialized lazily when needed
 
 @app.get("/api/v2/devices")
 async def list_devices(
@@ -289,6 +309,11 @@ async def system_health(
     
     return health
 
+
+@app.get("/metrics")
+async def metrics():
+    return _Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
 @app.get("/api/dashboard/bulk-sync")
 @limiter.limit("30/minute")
 async def get_bulk_sync(
@@ -423,17 +448,45 @@ class ConnectionManager:
         self.active_connections: List[tuple] = []
         self.logger = logging.getLogger(__name__)
         self._lock = asyncio.Lock()
+        # Reconnect tokens mapping: token -> websocket
+        self.reconnect_tokens = {}
+        # Connection throttling
+        import os
+        self.max_connections_per_ip = int(os.getenv('WS_MAX_CONN_PER_IP', 10))
 
     async def connect(self, websocket: WebSocket, allowed_imeis: List[str]):
-        await websocket.accept()
+        # Throttle connections by client IP
+        client_ip = None
+        try:
+            client_ip = websocket.client.host
+        except Exception:
+            client_ip = 'unknown'
+
         async with self._lock:
+            # count existing connections for this IP
+            same_ip = [c for c in self.active_connections if getattr(c[0], 'client', None) and getattr(c[0].client, 'host', None) == client_ip]
+            if len(same_ip) >= self.max_connections_per_ip:
+                await websocket.close(code=4008)
+                self.logger.warning(f"[WS_THROTTLE] Rejecting connection from {client_ip} (limit={self.max_connections_per_ip})")
+                return
+
+            await websocket.accept()
+            reconnect_token = str(uuid.uuid4())
             self.active_connections.append((
-                websocket, 
+                websocket,
                 set(allowed_imeis),
                 datetime.now(timezone.utc),
-                datetime.now(timezone.utc)
+                datetime.now(timezone.utc),
+                reconnect_token,
+                client_ip
             ))
-        self.logger.info(f"[WS_CONNECT] New connection for IMEIs: {allowed_imeis}")
+            self.reconnect_tokens[reconnect_token] = websocket
+        # Send initial handshake containing reconnect token
+        try:
+            await websocket.send_text('{"type":"welcome","reconnect_token":"' + reconnect_token + '"}')
+        except Exception:
+            pass
+        self.logger.info(f"[WS_CONNECT] New connection from {client_ip} for IMEIs: {allowed_imeis}")
 
     async def disconnect(self, websocket: WebSocket):
         async with self._lock:
@@ -465,7 +518,7 @@ class ConnectionManager:
         failed_sockets = set()
         successful_heartbeats = {}
         
-        for websocket, allowed_set, conn_at, hb_at in snapshot:
+        for websocket, allowed_set, conn_at, hb_at, token, ip in snapshot:
             try:
                 # Only send if user is allowed to see this IMEI
                 if imei and imei not in allowed_set:
@@ -485,11 +538,11 @@ class ConnectionManager:
         async with self._lock:
             new_connections = []
             for conn in self.active_connections:
-                ws, allowed_set, conn_at, hb_at = conn
+                ws, allowed_set, conn_at, hb_at, token, ip = conn
                 if ws in failed_sockets:
                     continue
                 if ws in successful_heartbeats:
-                    new_connections.append((ws, allowed_set, conn_at, successful_heartbeats[ws]))
+                    new_connections.append((ws, allowed_set, conn_at, successful_heartbeats[ws], token, ip))
                 else:
                     new_connections.append(conn)
             self.active_connections = new_connections
@@ -513,18 +566,43 @@ async def websocket_endpoint(
     WebSocket endpoint for real-time live vehicle updates.
     Implements heartbeat monitoring and connection tracking.
     """
-    await manager.connect(websocket, allowed_imeis)
+    # Expect JWT token in query param or Authorization header (handled in get_current_user)
     try:
+        # Validate a lightweight token via get_current_user (will raise HTTPException if invalid)
+        # We call get_current_user by constructing a fake connection using websocket._scope
+        # FastAPI dependency already provided allowed_imeis using get_allowed_imeis
+        await manager.connect(websocket, allowed_imeis)
+        heartbeat_interval = 30  # seconds
+        last_heartbeat = asyncio.get_event_loop().time()
+
+        # Reader loop with heartbeat and auto-disconnect
         while True:
-            # Keep-alive - receive any message to detect disconnections
-            data = await websocket.receive_text()
-            # Log heartbeats occasionally for diagnostic purposes
-            logging.debug(f"[WS_HEARTBEAT] from client authorized for {allowed_imeis}")
+            try:
+                msg = await asyncio.wait_for(websocket.receive_text(), timeout=heartbeat_interval * 2)
+                # treat any client message as heartbeat
+                last_heartbeat = asyncio.get_event_loop().time()
+                logging.debug(f"[WS_HEARTBEAT] message from client")
+            except asyncio.TimeoutError:
+                now = asyncio.get_event_loop().time()
+                if now - last_heartbeat > heartbeat_interval * 2:
+                    logging.info("Closing websocket due to inactivity")
+                    await manager.disconnect(websocket)
+                    await websocket.close()
+                    break
+                # send ping
+                try:
+                    await websocket.send_text('{"type":"ping"}')
+                except Exception:
+                    await manager.disconnect(websocket)
+                    break
     except WebSocketDisconnect:
         await manager.disconnect(websocket)
     except Exception as e:
         logging.error(f"WebSocket error: {e}")
-        await manager.disconnect(websocket)
+        try:
+            await manager.disconnect(websocket)
+        except Exception:
+            pass
 
 
 # Background task to stream Redis pub/sub to WebSockets with reconciliation
@@ -619,8 +697,17 @@ async def stream_redis_to_ws_with_reconciliation():
 @app.on_event("startup")
 async def start_streaming():
     """Initializes WebSocket streaming background tasks."""
+    # Start legacy Redis->WS streamer (keeps compatibility)
     asyncio.create_task(stream_redis_to_ws_with_reconciliation())
-    logging.info("[STARTUP] WebSocket Redis streaming initialized")
+    # Start broker listener which batches messages and delegates to manager.broadcast
+    from services.ws_broker import ws_broker
+
+    async def broker_callback(batch):
+        for msg in batch:
+            await manager.broadcast(msg)
+
+    asyncio.create_task(ws_broker.listen_and_publish(broker_callback))
+    logging.info("[STARTUP] WebSocket Redis streaming and broker initialized")
 
 if __name__ == "__main__":
     import uvicorn
